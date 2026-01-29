@@ -1,7 +1,7 @@
 """
-JERA PORTFOLIO ONBOARDING v4
+JERA PORTFOLIO ONBOARDING v5
 ============================
-Com busca de CNPJ para fundos via CVM
+Com busca CNPJ melhorada
 """
 
 import streamlit as st
@@ -12,7 +12,6 @@ from datetime import datetime
 import io
 import tempfile
 from pathlib import Path
-import requests
 
 st.set_page_config(
     page_title="Jera - Portfolio Onboarding",
@@ -51,60 +50,59 @@ def get_isin(tipo: str, vencimento: str) -> str:
     return None
 
 # =============================================================================
-# CVM FUND LOOKUP (46k+ fundos brasileiros)
+# CVM FUND LOOKUP (Improved)
 # =============================================================================
 
-@st.cache_data(ttl=3600)
-def load_cvm_funds():
-    """Carrega base de fundos da CVM"""
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_cvm_data():
+    """Carrega DataFrame completo da CVM"""
     try:
         url = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
         df = pd.read_csv(url, sep=";", encoding="latin1", low_memory=False)
-        
-        # Create lookup dict: normalized name -> CNPJ
-        lookup = {}
-        for _, row in df.iterrows():
-            name = str(row.get("DENOM_SOCIAL", "")).upper()
-            cnpj = str(row.get("CNPJ_FUNDO", ""))
-            if name and cnpj:
-                # Normalize name for matching
-                name_norm = re.sub(r"[^A-Z0-9]", "", name)
-                lookup[name_norm] = cnpj
-                # Also store partial names (first 3 words)
-                words = name.split()[:4]
-                if len(words) >= 2:
-                    partial = re.sub(r"[^A-Z0-9]", "", " ".join(words))
-                    if partial not in lookup:
-                        lookup[partial] = cnpj
-        
-        return lookup
+        return df
     except Exception as e:
-        st.warning(f"⚠️ Não foi possível carregar base CVM: {e}")
-        return {}
+        st.error(f"Erro ao carregar CVM: {e}")
+        return None
 
-def find_cnpj(fund_name: str, cvm_lookup: dict) -> str:
-    """Busca CNPJ do fundo na base CVM"""
-    if not cvm_lookup:
+def find_cnpj(fund_name: str, cvm_df: pd.DataFrame) -> str:
+    """Busca CNPJ usando palavras-chave (ignora siglas de tipo de fundo)"""
+    if cvm_df is None or cvm_df.empty:
         return None
     
-    # Normalize fund name
-    name_norm = re.sub(r"[^A-Z0-9]", "", fund_name.upper())
+    name_upper = fund_name.upper()
     
-    # Direct match
-    if name_norm in cvm_lookup:
-        return cvm_lookup[name_norm]
+    # Palavras a ignorar (tipos de fundo, sufixos comuns)
+    skip_words = {
+        "FIM", "FIC", "FIDC", "FIP", "FIF", "FCFM", "FFIM", "FIQ", "FICFIM", 
+        "FC", "FM", "CP", "RF", "FI", "SUB", "FEE", "AB", "MU", "Z", "II", "III",
+        "I", "IV", "V", "PF", "ML", "BR", "CL", "T5", "REF", "OVER", "IPCA",
+        "PRE", "D", "LEG", "ALL", "MAR", "DEB"
+    }
     
-    # Partial match (try progressively shorter)
-    words = fund_name.upper().split()
-    for length in range(len(words), 1, -1):
-        partial = re.sub(r"[^A-Z0-9]", "", " ".join(words[:length]))
-        if partial in cvm_lookup:
-            return cvm_lookup[partial]
+    # Extrair palavras-chave relevantes
+    words = [w for w in name_upper.split() if w not in skip_words and len(w) > 1]
     
-    # Fuzzy match - check if name contains key parts
-    for key, cnpj in cvm_lookup.items():
-        if len(key) > 10 and key in name_norm:
-            return cnpj
+    if not words:
+        return None
+    
+    # Buscar progressivamente refinando
+    candidates = cvm_df.copy()
+    
+    for word in words:
+        new_candidates = candidates[
+            candidates["DENOM_SOCIAL"].str.upper().str.contains(word, na=False, regex=False)
+        ]
+        if len(new_candidates) > 0:
+            candidates = new_candidates
+        if len(candidates) == 1:
+            break
+    
+    if len(candidates) > 0:
+        # Priorizar fundos em funcionamento normal
+        ativos = candidates[candidates["SIT"].str.contains("FUNCIONAMENTO", na=False)]
+        if len(ativos) > 0:
+            return str(ativos.iloc[0]["CNPJ_FUNDO"])
+        return str(candidates.iloc[0]["CNPJ_FUNDO"])
     
     return None
 
@@ -112,7 +110,7 @@ def find_cnpj(fund_name: str, cvm_lookup: dict) -> str:
 # BTG PDF PARSER
 # =============================================================================
 
-def parse_btg_pdf(pdf_file, cvm_lookup: dict) -> tuple:
+def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
     """Parser para extratos BTG"""
     assets = []
     metadata = {"fund_name": "", "nav": None}
@@ -149,7 +147,7 @@ def parse_btg_pdf(pdf_file, cvm_lookup: dict) -> tuple:
                 value = float(match.group(4).replace(",", ""))
                 
                 # Find CNPJ
-                cnpj = find_cnpj(name, cvm_lookup)
+                cnpj = find_cnpj(name, cvm_df)
                 
                 assets.append({
                     "description": name,
@@ -232,11 +230,11 @@ def parse_btg_pdf(pdf_file, cvm_lookup: dict) -> tuple:
 
 def main():
     st.title("📊 Jera Portfolio Onboarding")
-    st.markdown("**Extratos BTG → Dados estruturados com CNPJ/ISIN**")
+    st.markdown("**Extratos BTG → Dados com CNPJ/ISIN automáticos**")
     
     # Load CVM data
-    with st.spinner("📚 Carregando base de fundos CVM (46k+ fundos)..."):
-        cvm_lookup = load_cvm_funds()
+    with st.spinner("📚 Carregando base CVM..."):
+        cvm_df = load_cvm_data()
     
     with st.sidebar:
         st.header("📁 Upload")
@@ -247,33 +245,22 @@ def main():
         )
         
         st.divider()
-        st.success(f"✅ {len(cvm_lookup):,} fundos CVM carregados")
+        if cvm_df is not None:
+            st.success(f"✅ {len(cvm_df):,} fundos CVM")
         
         st.markdown("""
         **Identificadores:**
-        - Fundos → **CNPJ** (via CVM)
-        - Títulos Públicos → **ISIN**
-        - CRI/CRA/Deb → Manual
+        - Fundos → **CNPJ** (CVM)
+        - Títulos → **ISIN**
         """)
     
     if uploaded_file is None:
         st.info("👆 Faça upload de um extrato BTG")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("### 1️⃣ Upload")
-            st.markdown("PDF do extrato")
-        with col2:
-            st.markdown("### 2️⃣ Extração")
-            st.markdown("CNPJ + ISIN automático")
-        with col3:
-            st.markdown("### 3️⃣ Export")
-            st.markdown("Excel para Maravi")
         return
     
     # Process
-    with st.spinner("🔄 Processando extrato..."):
-        assets, metadata = parse_btg_pdf(uploaded_file, cvm_lookup)
+    with st.spinner("🔄 Processando..."):
+        assets, metadata = parse_btg_pdf(uploaded_file, cvm_df)
     
     if not assets:
         st.error("❌ Não foi possível extrair ativos")
@@ -299,13 +286,13 @@ def main():
     pendente = total - com_cnpj - com_isin
     
     with col1:
-        st.metric("Total Ativos", total)
+        st.metric("Total", total)
     with col2:
-        st.metric("✅ Com CNPJ", com_cnpj)
+        st.metric("✅ CNPJ", int(com_cnpj))
     with col3:
-        st.metric("✅ Com ISIN", com_isin)
+        st.metric("✅ ISIN", int(com_isin))
     with col4:
-        st.metric("⏳ Pendente", pendente)
+        st.metric("⏳ Pendente", int(pendente))
     
     # By type
     type_stats = df.groupby("type").agg(
@@ -314,13 +301,11 @@ def main():
         Identificados=("status", lambda x: (x == "OK").sum())
     ).reset_index()
     type_stats["Valor"] = type_stats["Valor"].apply(lambda x: f"R$ {x:,.2f}")
-    type_stats.columns = ["Tipo", "Qtd", "Valor Total", "Identificados"]
     st.dataframe(type_stats, use_container_width=True, hide_index=True)
     
     # Table
-    st.subheader("📝 Ativos Extraídos")
+    st.subheader("📝 Ativos")
     
-    # Reorder columns
     cols = ["description", "type", "pct_pl", "value", "vencimento", "cnpj", "isin", "status"]
     df_display = df[[c for c in cols if c in df.columns]]
     
@@ -333,7 +318,7 @@ def main():
             "pct_pl": st.column_config.NumberColumn("%PL", format="%.2f"),
             "value": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
             "vencimento": st.column_config.TextColumn("Vencimento"),
-            "cnpj": st.column_config.TextColumn("CNPJ"),
+            "cnpj": st.column_config.TextColumn("CNPJ", width="medium"),
             "isin": st.column_config.TextColumn("ISIN"),
             "status": st.column_config.SelectboxColumn("Status", options=["OK", "REVISAR", "PENDENTE"]),
         },
