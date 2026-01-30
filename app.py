@@ -1,7 +1,8 @@
 """
-JERA PORTFOLIO ONBOARDING v11
+JERA PORTFOLIO ONBOARDING v14
 =============================
-Com OpenFIGI API para busca de ISIN/identificadores
+Com OpenFIGI funcionando (sem exchCode)
++ Base local de ISINs como fallback
 """
 
 import streamlit as st
@@ -13,7 +14,6 @@ import io
 import tempfile
 from pathlib import Path
 import requests
-import json
 
 st.set_page_config(
     page_title="Jera - Portfolio Onboarding",
@@ -22,15 +22,12 @@ st.set_page_config(
 )
 
 # =============================================================================
-# APIs CONFIG
+# CONFIG
 # =============================================================================
 
 OPENFIGI_API_KEY = "01e15cc4-a2d8-47b6-8323-746430a85b52"
 OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
-
-# =============================================================================
-# FORMATO DE SAÍDA
-# =============================================================================
+ISIN_GITHUB_URL = "https://raw.githubusercontent.com/Felipemqn/jera-portfolio-onboarding/main/base_isin.xlsx"
 
 OUTPUT_COLUMNS = [
     "Data", "Trading Desk", "ProductSource", "Classificação Investimentos",
@@ -40,73 +37,103 @@ OUTPUT_COLUMNS = [
 ]
 
 # =============================================================================
-# OPENFIGI API
+# OPENFIGI API (CORRIGIDO - SEM EXCHCODE!)
 # =============================================================================
 
-def search_openfigi(query: str, id_type: str = "NAME", exchange: str = None) -> list:
-    """
-    Busca no OpenFIGI
-    id_type: NAME, TICKER, ISIN, CUSIP, SEDOL, etc.
-    """
+def search_openfigi(ticker: str) -> dict:
+    """Busca no OpenFIGI - SEM exchCode funciona melhor para Brasil!"""
+    if not ticker:
+        return None
+    
     headers = {
         "Content-Type": "application/json",
         "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY
     }
     
-    payload = {"query": query, "idType": id_type}
-    
-    if exchange:
-        payload["exchCode"] = exchange
-    
-    # Para ativos brasileiros
-    if not exchange:
-        payload["exchCode"] = "BZ"  # Brazil
+    # NÃO usar exchCode - funciona melhor assim!
+    payload = [{"idType": "TICKER", "idValue": ticker.upper()}]
     
     try:
-        response = requests.post(
-            OPENFIGI_URL,
-            headers=headers,
-            json=[payload],
-            timeout=10
-        )
+        response = requests.post(OPENFIGI_URL, headers=headers, json=payload, timeout=10)
         
         if response.status_code == 200:
-            data = response.json()
-            if data and len(data) > 0 and "data" in data[0]:
-                return data[0]["data"]
-        return []
+            result = response.json()[0]
+            if "data" in result and result["data"]:
+                item = result["data"][0]
+                return {
+                    "figi": item.get("figi"),
+                    "name": item.get("name"),
+                    "ticker": item.get("ticker"),
+                    "exchCode": item.get("exchCode"),
+                    "securityType": item.get("securityType"),
+                    "marketSector": item.get("marketSector")
+                }
     except Exception as e:
-        st.warning(f"Erro OpenFIGI: {e}")
-        return []
+        pass
+    
+    return None
 
-def search_openfigi_batch(queries: list) -> dict:
-    """
-    Busca em lote no OpenFIGI
-    queries: lista de dicts {"query": "...", "idType": "..."}
-    """
+def search_openfigi_batch(tickers: list) -> dict:
+    """Busca em lote no OpenFIGI"""
+    if not tickers:
+        return {}
+    
     headers = {
         "Content-Type": "application/json",
         "X-OPENFIGI-APIKEY": OPENFIGI_API_KEY
     }
     
-    # Adicionar exchange Brasil para todas
-    for q in queries:
-        if "exchCode" not in q:
-            q["exchCode"] = "BZ"
+    # Criar payload SEM exchCode
+    payload = [{"idType": "TICKER", "idValue": t.upper()} for t in tickers if t]
+    
+    if not payload:
+        return {}
     
     try:
-        response = requests.post(
-            OPENFIGI_URL,
-            headers=headers,
-            json=queries,
-            timeout=30
-        )
+        response = requests.post(OPENFIGI_URL, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
-            return response.json()
-        return []
+            results = {}
+            for i, result in enumerate(response.json()):
+                ticker = tickers[i]
+                if "data" in result and result["data"]:
+                    item = result["data"][0]
+                    results[ticker] = {
+                        "figi": item.get("figi"),
+                        "name": item.get("name"),
+                        "ticker": item.get("ticker"),
+                        "exchCode": item.get("exchCode"),
+                        "securityType": item.get("securityType")
+                    }
+            return results
     except Exception as e:
-        return []
+        pass
+    
+    return {}
+
+# =============================================================================
+# BASE LOCAL DE ISINs (FALLBACK)
+# =============================================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_isin_database():
+    try:
+        df = pd.read_excel(ISIN_GITHUB_URL)
+        return df, "GitHub"
+    except:
+        return pd.DataFrame(columns=["Tipo", "Ticker", "Nome", "ISIN"]), "Vazio"
+
+def find_isin_local(ticker: str = None, nome: str = None, isin_df: pd.DataFrame = None) -> str:
+    """Busca ISIN na base local (fallback)"""
+    if isin_df is None or isin_df.empty:
+        return None
+    
+    if ticker:
+        match = isin_df[isin_df["Ticker"].str.upper() == ticker.upper()]
+        if not match.empty:
+            return match.iloc[0]["ISIN"]
+    
+    return None
 
 # =============================================================================
 # CVM DATA
@@ -118,11 +145,10 @@ def load_cvm_data():
         url = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
         df = pd.read_csv(url, sep=";", encoding="latin1", low_memory=False)
         return df
-    except Exception as e:
+    except:
         return None
 
 def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set = None, limit: int = 5) -> list:
-    """Busca CNPJ na base da CVM"""
     if cvm_df is None or cvm_df.empty:
         return []
     
@@ -130,6 +156,8 @@ def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set = None, 
         used_cnpjs = set()
     
     name_upper = fund_name.upper().strip()
+    name_clean = re.sub(r'\s*%.*$', '', name_upper)
+    name_clean = re.sub(r'\s+\d+\.\d+.*$', '', name_clean)
     
     noise_words = {
         "FIM", "FIC", "FIDC", "FIP", "FIF", "FCFM", "FFIM", "FIQ", "FICFIM",
@@ -140,7 +168,7 @@ def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set = None, 
         "CREDITO", "PRIVADO", "RENDA", "FIXA"
     }
     
-    words = [w for w in name_upper.split() if w not in noise_words and len(w) >= 2]
+    words = [w for w in name_clean.split() if w not in noise_words and len(w) >= 2]
     
     if not words:
         return []
@@ -155,7 +183,6 @@ def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set = None, 
         if len(new_candidates) > 0:
             candidates = new_candidates
             matched_count += 1
-        
         if len(candidates) <= limit * 2:
             break
     
@@ -182,59 +209,63 @@ def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set = None, 
     return results
 
 # =============================================================================
-# CLASSIFICAÇÃO DINÂMICA
+# CLASSIFICAÇÃO
 # =============================================================================
 
 def classify_asset(nome: str) -> tuple:
     nome_upper = nome.upper()
+    nome_clean = re.sub(r'\s*%.*$', '', nome_upper)
     
     tipo_ativo = "Fundo"
     
-    if any(x in nome_upper for x in ["LFT", "LTN", "NTN", "TESOURO"]):
+    if any(x in nome_clean for x in ["LFT", "LTN", "NTN", "TESOURO"]) and not any(x in nome_clean for x in ["FI ", "FIM", "FIC"]):
         tipo_ativo = "Tit Publico"
-    elif any(x in nome_upper for x in ["CRI ", "CRI-", " CRI"]):
+    elif re.search(r'\bCRI\b', nome_clean):
         tipo_ativo = "CRI"
-    elif any(x in nome_upper for x in ["CRA ", "CRA-", " CRA"]):
+    elif re.search(r'\bCRA\b', nome_clean):
         tipo_ativo = "CRA"
-    elif any(x in nome_upper for x in ["DEB ", "DEBENTURE"]):
+    elif re.search(r'\bDEB\b', nome_clean) or "DEBENTURE" in nome_clean:
         tipo_ativo = "Debenture"
-    elif re.search(r"[A-Z]{4}11", nome_upper):
+    elif re.search(r'[A-Z]{4}11\b', nome_clean):
         tipo_ativo = "FII"
-    elif any(x in nome_upper for x in ["LCI", "LCA", "CDB"]):
+    elif any(x in nome_clean for x in ["LCI", "LCA", "CDB"]):
         tipo_ativo = "RF Bancario"
     
     classificacao = "Retorno Absoluto Brasil"
     
-    if any(x in nome_upper for x in ["SELIC", "LFT", "CDI", "LIQUIDEZ", "CAIXA", "CASH"]):
+    if any(x in nome_clean for x in ["SELIC", "LFT", "LIQUIDEZ", "CAIXA", "CASH"]):
         classificacao = "Liquidez CDI"
-    elif any(x in nome_upper for x in ["LTN", "PRE", "PREFIXADO"]):
+    elif "CDI" in nome_clean and tipo_ativo not in ["Tit Publico"]:
+        classificacao = "Liquidez CDI"
+    elif any(x in nome_clean for x in ["LTN"]) and tipo_ativo == "Tit Publico":
         classificacao = "Renda Fixa Brasil Pré-Fixado"
-    elif any(x in nome_upper for x in ["NTN", "IPCA", "INFLACAO", "IMA-B"]):
+    elif any(x in nome_clean for x in ["PRE", "PREFIXADO"]) and tipo_ativo in ["CRI", "Debenture"]:
+        classificacao = "Renda Fixa Brasil Pré-Fixado"
+    elif any(x in nome_clean for x in ["NTN", "IPCA", "INFLACAO", "IMA-B"]):
         classificacao = "Renda Fixa Brasil Inflação"
-    elif any(x in nome_upper for x in ["CRED", "FIDC", "HIGH YIELD", "CRI", "CRA", "DEB"]):
+    elif any(x in nome_clean for x in ["CRED", "FIDC", "HIGH YIELD"]) or tipo_ativo in ["CRI", "CRA", "Debenture"]:
         classificacao = "Renda Fixa Brasil Crédito Pós-Fixado"
-    elif any(x in nome_upper for x in ["ACAO", "ACOES", "EQUITY", "LONG", "FIA", "IBOV"]):
+    elif any(x in nome_clean for x in ["ACAO", "ACOES", "EQUITY", "LONG", "FIA", "IBOV"]):
         classificacao = "Renda Variável Brasil"
-    elif any(x in nome_upper for x in ["IMOB", "FII", "REAL ESTATE"]) or re.search(r"[A-Z]{4}11", nome_upper):
+    elif any(x in nome_clean for x in ["IMOB", "REAL ESTATE"]) or tipo_ativo == "FII":
         classificacao = "Real Estate Brasil"
-    elif any(x in nome_upper for x in ["FIP", "PRIVATE EQUITY", "VENTURE"]):
+    elif any(x in nome_clean for x in ["FIP", "PRIVATE EQUITY", "VENTURE", "TRATOR", "TERRAS"]):
         classificacao = "Private Equity Brasil"
     
     return tipo_ativo, classificacao
 
 def extract_ticker(nome: str) -> str:
-    fii_match = re.search(r"([A-Z]{4}11)", nome.upper())
+    nome_upper = nome.upper()
+    fii_match = re.search(r'\b([A-Z]{4}11)\b', nome_upper)
     if fii_match:
         return fii_match.group(1)
-    
-    deb_match = re.search(r"([A-Z]{4}\d{2})", nome.upper())
+    deb_match = re.search(r'\b([A-Z]{4}\d{2})\b', nome_upper)
     if deb_match:
         return deb_match.group(1)
-    
     return None
 
 def extract_vencimento(nome: str) -> str:
-    match = re.search(r"(\d{2}/\d{2}/\d{4})", nome)
+    match = re.search(r'(\d{2}/\d{2}/\d{4})', nome)
     if match:
         return match.group(1)
     return None
@@ -243,7 +274,7 @@ def extract_vencimento(nome: str) -> str:
 # BTG PDF PARSER
 # =============================================================================
 
-def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
+def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame, isin_df: pd.DataFrame, use_openfigi: bool = True) -> tuple:
     assets = []
     metadata = {"fund_name": "", "nav": None}
     used_cnpjs = set()
@@ -269,12 +300,40 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                 except:
                     pass
             
+            # TÍTULOS PÚBLICOS com vencimento
+            titulo_pattern = r"(\d+)-\s*(LFT|LTN|NTNB|NTN-?B)[A-Z\s]*\s+(\d+\.\d{2})\s+([\d,]+\.\d{2})\s+[\d,]+\s+[\d.,]+\s+(\d{2}/\d{2}/\d{4})"
+            
+            for match in re.finditer(titulo_pattern, all_text):
+                tipo = match.group(2).upper().replace("-", "")
+                pct_pl = float(match.group(3))
+                value = float(match.group(4).replace(",", ""))
+                vencimento = match.group(5)
+                
+                nome = f"{tipo} {vencimento}"
+                
+                assets.append({
+                    "nome": nome,
+                    "tipo_ativo": "Tit Publico",
+                    "classificacao": "Renda Fixa Brasil Inflação" if "NTN" in tipo else ("Liquidez CDI" if "LFT" in tipo else "Renda Fixa Brasil Pré-Fixado"),
+                    "pct_pl": pct_pl,
+                    "value": value,
+                    "cnpj": None,
+                    "ticker": tipo,
+                    "isin": None,
+                    "vencimento": vencimento,
+                    "status": "Verificar"
+                })
+            
+            # FUNDOS e outros ativos
             asset_pattern = r"(\d+)-\s*([A-Z][A-Z0-9\s\-\+\%\,\.]+?)\s+(\d+\.\d{2})\s+([\d,]+\.\d{2})"
             
             for match in re.finditer(asset_pattern, all_text):
                 nome = match.group(2).strip()
                 pct_pl = float(match.group(3))
                 value = float(match.group(4).replace(",", ""))
+                
+                if any(a["nome"] in nome or nome in a["nome"] for a in assets if a["tipo_ativo"] == "Tit Publico"):
+                    continue
                 
                 if len(nome) < 3 or pct_pl > 100:
                     continue
@@ -293,8 +352,11 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                 ticker = extract_ticker(nome)
                 vencimento = extract_vencimento(nome)
                 
+                # Status inicial
                 if tipo_ativo == "Fundo":
                     status = "OK" if cnpj and score >= 0.5 else ("Verificar" if cnpj else "Pendente")
+                elif ticker:
+                    status = "Verificar"
                 else:
                     status = "Pendente"
                 
@@ -311,6 +373,7 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                     "status": status
                 })
             
+            # Remover duplicados
             seen = set()
             unique = []
             for a in assets:
@@ -319,57 +382,36 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                     seen.add(key)
                     unique.append(a)
             assets = unique
+            
+            # ENRIQUECER COM OPENFIGI
+            if use_openfigi:
+                tickers_to_search = [a["ticker"] for a in assets if a["ticker"] and a["tipo_ativo"] in ["FII", "Debenture", "Ação"]]
+                
+                if tickers_to_search:
+                    figi_results = search_openfigi_batch(tickers_to_search)
+                    
+                    for asset in assets:
+                        ticker = asset.get("ticker")
+                        if ticker and ticker in figi_results:
+                            figi_data = figi_results[ticker]
+                            asset["figi"] = figi_data.get("figi")
+                            asset["figi_name"] = figi_data.get("name")
+                            if asset["status"] == "Verificar":
+                                asset["status"] = "OK"
+            
+            # FALLBACK: Base local de ISINs
+            for asset in assets:
+                if not asset.get("isin"):
+                    ticker = asset.get("ticker")
+                    if ticker:
+                        local_isin = find_isin_local(ticker=ticker, isin_df=isin_df)
+                        if local_isin:
+                            asset["isin"] = local_isin
     
     finally:
         Path(tmp_path).unlink(missing_ok=True)
     
     return assets, metadata
-
-def enrich_with_openfigi(assets: list) -> list:
-    """Enriquece ativos com dados do OpenFIGI"""
-    # Preparar queries para títulos e FIIs
-    queries = []
-    query_map = {}  # índice -> asset index
-    
-    for i, asset in enumerate(assets):
-        ticker = asset.get("ticker")
-        nome = asset.get("nome", "")
-        tipo = asset.get("tipo_ativo", "")
-        
-        if tipo == "Tit Publico":
-            # Buscar por nome
-            queries.append({"query": nome, "idType": "NAME"})
-            query_map[len(queries)-1] = i
-        elif ticker:
-            # Buscar por ticker
-            queries.append({"query": ticker, "idType": "TICKER"})
-            query_map[len(queries)-1] = i
-    
-    if not queries:
-        return assets
-    
-    # Fazer busca em lote
-    results = search_openfigi_batch(queries)
-    
-    # Processar resultados
-    for q_idx, result in enumerate(results):
-        if q_idx in query_map and "data" in result and result["data"]:
-            asset_idx = query_map[q_idx]
-            figi_data = result["data"][0]
-            
-            # Extrair ISIN se disponível
-            if "shareClassFIGI" in figi_data:
-                assets[asset_idx]["figi"] = figi_data.get("figi")
-            
-            # Atualizar ticker se não tinha
-            if not assets[asset_idx].get("ticker") and figi_data.get("ticker"):
-                assets[asset_idx]["ticker"] = figi_data.get("ticker")
-            
-            # Atualizar status
-            if assets[asset_idx]["status"] == "Pendente":
-                assets[asset_idx]["status"] = "Verificar"
-    
-    return assets
 
 def convert_to_output_format(assets: list, metadata: dict, data_ref: str, trading_desk: str) -> pd.DataFrame:
     rows = []
@@ -407,17 +449,18 @@ def main():
     st.title("📊 Jera Portfolio Onboarding")
     
     # Carregar dados
-    with st.spinner("📚 Carregando bases de dados..."):
+    with st.spinner("📚 Carregando bases..."):
         cvm_df = load_cvm_data()
+        isin_df, isin_source = load_isin_database()
     
     # Tabs
-    tab1, tab2 = st.tabs(["📄 Upload PDF", "🔍 Consulta Individual"])
+    tab1, tab2, tab3 = st.tabs(["📄 Upload PDF", "🔍 Consulta Individual", "📋 Base de ISINs"])
     
     # =================================================================
     # TAB 1: UPLOAD PDF
     # =================================================================
     with tab1:
-        st.markdown("**Processa extrato BTG completo**")
+        st.markdown("**Processa extrato BTG**")
         
         col_upload, col_config = st.columns([2, 1])
         
@@ -425,28 +468,29 @@ def main():
             st.markdown("**Configurações:**")
             data_ref = st.date_input("Data Referência", value=datetime.now(), key="pdf_data")
             trading_desk = st.text_input("Trading Desk", value="", key="pdf_desk")
-            use_openfigi = st.checkbox("Usar OpenFIGI", value=True, help="Buscar dados adicionais no OpenFIGI")
+            use_openfigi = st.checkbox("🌐 Usar OpenFIGI", value=True, help="Buscar FIGIs para FIIs e debêntures")
         
         with col_upload:
             uploaded_file = st.file_uploader("Arraste o PDF aqui", type=['pdf'])
         
         if uploaded_file:
             with st.spinner("🔄 Processando PDF..."):
-                assets, metadata = parse_btg_pdf(uploaded_file, cvm_df)
+                assets, metadata = parse_btg_pdf(uploaded_file, cvm_df, isin_df, use_openfigi)
             
             if not assets:
                 st.error("❌ Não foi possível extrair ativos")
                 return
             
-            # Enriquecer com OpenFIGI
-            if use_openfigi:
-                with st.spinner("🔍 Buscando no OpenFIGI..."):
-                    assets = enrich_with_openfigi(assets)
-            
             if not trading_desk and metadata.get("fund_name"):
                 trading_desk = metadata["fund_name"]
             
             st.success(f"✅ **{len(assets)} ativos** extraídos")
+            
+            # Stats OpenFIGI
+            if use_openfigi:
+                figi_count = sum(1 for a in assets if a.get("figi"))
+                if figi_count > 0:
+                    st.info(f"🌐 OpenFIGI: {figi_count} ativos identificados")
             
             df_output = convert_to_output_format(
                 assets, metadata,
@@ -461,10 +505,21 @@ def main():
             col3.metric("🟡 Verificar", len(df_output[df_output["Status"] == "Verificar"]))
             col4.metric("🔴 Pendente", len(df_output[df_output["Status"] == "Pendente"]))
             
-            # Tabela
-            edited_df = st.data_editor(df_output, use_container_width=True, hide_index=True, num_rows="dynamic")
+            # Tabela editável
+            st.subheader("📝 Ativos (editável)")
+            edited_df = st.data_editor(
+                df_output, 
+                use_container_width=True, 
+                hide_index=True, 
+                num_rows="dynamic",
+                column_config={
+                    "ISIN": st.column_config.TextColumn("ISIN", help="Preencha manualmente se necessário"),
+                    "Status": st.column_config.SelectboxColumn("Status", options=["OK", "Verificar", "Pendente"]),
+                }
+            )
             
             # Export
+            st.subheader("💾 Exportar")
             col1, col2 = st.columns(2)
             with col1:
                 buffer = io.BytesIO()
@@ -486,182 +541,128 @@ def main():
     with tab2:
         st.markdown("**Consulta um ativo específico**")
         
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            nome_ativo = st.text_input(
-                "Nome do Ativo",
-                placeholder="Ex: SPX CAPITAL PLUS FIQ, NTNB 15/08/2050, RBRY11...",
-                key="consulta_nome"
-            )
-        
-        with col2:
-            search_type = st.selectbox(
-                "Tipo de Busca",
-                ["Auto", "Nome", "Ticker", "ISIN", "CNPJ"],
-                key="search_type"
-            )
+        nome_ativo = st.text_input(
+            "Nome ou Ticker do Ativo",
+            placeholder="Ex: SPX CAPITAL PLUS FIQ, PRLK11, HGLG11, PETR4...",
+            key="consulta_nome"
+        )
         
         if nome_ativo:
             st.divider()
             
-            # Classificar
             tipo_ativo, classificacao = classify_asset(nome_ativo)
-            ticker = extract_ticker(nome_ativo)
-            vencimento = extract_vencimento(nome_ativo)
+            ticker = extract_ticker(nome_ativo) or nome_ativo.upper().strip()
             
-            # Exibir classificação
             col1, col2, col3 = st.columns(3)
             col1.metric("Tipo Ativo", tipo_ativo)
             col2.metric("Classificação", classificacao)
-            if ticker:
-                col3.metric("Ticker", ticker)
-            elif vencimento:
-                col3.metric("Vencimento", vencimento)
+            col3.metric("Ticker", ticker)
             
             st.divider()
             
-            # ===== BUSCA CVM (Fundos) =====
+            # Busca OpenFIGI
+            st.markdown("### 🌐 OpenFIGI")
+            with st.spinner("Buscando no OpenFIGI..."):
+                figi_result = search_openfigi(ticker)
+            
+            if figi_result:
+                st.success("✅ Encontrado no OpenFIGI!")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**FIGI:** `{figi_result.get('figi')}`")
+                    st.markdown(f"**Nome:** {figi_result.get('name')}")
+                with col2:
+                    st.markdown(f"**Ticker:** {figi_result.get('ticker')}")
+                    st.markdown(f"**Exchange:** {figi_result.get('exchCode')}")
+                    st.markdown(f"**Tipo:** {figi_result.get('securityType')}")
+            else:
+                st.warning("⚠️ Não encontrado no OpenFIGI")
+            
+            # Busca base local
+            st.markdown("### 📋 Base Local")
+            local_isin = find_isin_local(ticker=ticker, isin_df=isin_df)
+            if local_isin:
+                st.success(f"✅ ISIN encontrado: `{local_isin}`")
+            else:
+                st.info("ℹ️ Não encontrado na base local")
+            
+            # Busca CVM para fundos
             if tipo_ativo == "Fundo":
-                st.markdown("### 🏦 Busca na CVM")
+                st.markdown("### 🏦 CVM (CNPJ)")
                 
                 if cvm_df is not None:
                     with st.spinner("Buscando na CVM..."):
-                        matches = find_cnpj_cvm(nome_ativo, cvm_df, limit=10)
+                        matches = find_cnpj_cvm(nome_ativo, cvm_df, limit=5)
                     
                     if matches:
-                        st.success(f"✅ {len(matches)} resultado(s) na CVM")
-                        
+                        st.success(f"✅ {len(matches)} resultado(s)")
                         for i, match in enumerate(matches):
                             status_icon = "🟢" if match["ativo"] else "🔴"
                             score_pct = int(match["score"] * 100)
-                            
-                            with st.expander(f"{status_icon} {match['cnpj']} (Match: {score_pct}%)", expanded=(i==0)):
+                            with st.expander(f"{status_icon} {match['cnpj']} ({score_pct}%)", expanded=(i==0)):
                                 st.markdown(f"**Nome:** {match['nome']}")
-                                st.markdown(f"**Situação:** {match['situacao']}")
-                                st.code(match['cnpj'], language=None)
+                                st.code(match['cnpj'])
                     else:
-                        st.warning("⚠️ Nenhum fundo encontrado na CVM")
-                else:
-                    st.error("❌ Base CVM não disponível")
+                        st.warning("⚠️ Não encontrado na CVM")
+    
+    # =================================================================
+    # TAB 3: BASE DE ISINs
+    # =================================================================
+    with tab3:
+        st.markdown("### 📋 Base Local de ISINs (Fallback)")
+        
+        st.info(f"""
+        **Fonte:** {isin_source} | **Registros:** {len(isin_df)}
+        
+        Esta base é usada como fallback quando o OpenFIGI não encontra o ativo.
+        """)
+        
+        if not isin_df.empty:
+            tipos = ["Todos"] + list(isin_df["Tipo"].unique())
+            tipo_filtro = st.selectbox("Filtrar:", tipos)
             
-            # ===== BUSCA OPENFIGI =====
-            st.markdown("### 🌐 Busca no OpenFIGI")
-            
-            with st.spinner("Buscando no OpenFIGI..."):
-                # Determinar tipo de busca
-                if search_type == "Auto":
-                    if ticker:
-                        id_type = "TICKER"
-                        query = ticker
-                    elif re.match(r"^BR[A-Z0-9]{10}$", nome_ativo.upper()):
-                        id_type = "ISIN"
-                        query = nome_ativo.upper()
-                    else:
-                        id_type = "NAME"
-                        query = nome_ativo
-                elif search_type == "Ticker":
-                    id_type = "TICKER"
-                    query = ticker or nome_ativo
-                elif search_type == "ISIN":
-                    id_type = "ISIN"
-                    query = nome_ativo.upper()
-                else:
-                    id_type = "NAME"
-                    query = nome_ativo
-                
-                figi_results = search_openfigi(query, id_type)
-            
-            if figi_results:
-                st.success(f"✅ {len(figi_results)} resultado(s) no OpenFIGI")
-                
-                # Mostrar resultados em tabela
-                figi_df = pd.DataFrame([{
-                    "FIGI": r.get("figi", ""),
-                    "Ticker": r.get("ticker", ""),
-                    "Nome": r.get("name", ""),
-                    "Exchange": r.get("exchCode", ""),
-                    "Tipo": r.get("securityType", ""),
-                    "Moeda": r.get("marketSector", "")
-                } for r in figi_results[:10]])
-                
-                st.dataframe(figi_df, use_container_width=True, hide_index=True)
-                
-                # Detalhes do primeiro resultado
-                if figi_results:
-                    with st.expander("📋 Detalhes do primeiro resultado", expanded=True):
-                        first = figi_results[0]
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"**FIGI:** `{first.get('figi', 'N/A')}`")
-                            st.markdown(f"**Ticker:** `{first.get('ticker', 'N/A')}`")
-                            st.markdown(f"**Nome:** {first.get('name', 'N/A')}")
-                        with col2:
-                            st.markdown(f"**Exchange:** {first.get('exchCode', 'N/A')}")
-                            st.markdown(f"**Tipo:** {first.get('securityType', 'N/A')}")
-                            st.markdown(f"**Setor:** {first.get('marketSector', 'N/A')}")
+            if tipo_filtro != "Todos":
+                df_show = isin_df[isin_df["Tipo"] == tipo_filtro]
             else:
-                st.info("ℹ️ Nenhum resultado no OpenFIGI")
-                st.markdown("**Dicas:**")
-                st.markdown("- Para títulos públicos brasileiros, tente buscar por 'LFT', 'LTN', 'NTNB'")
-                st.markdown("- Para FIIs, use o ticker (ex: RBRY11)")
-                st.markdown("- Para ações, use o ticker (ex: PETR4)")
+                df_show = isin_df
             
-            # ===== RESUMO =====
-            st.divider()
-            st.markdown("### 📋 Resumo")
-            
-            # Consolidar melhor resultado
-            cnpj_result = None
-            if tipo_ativo == "Fundo" and cvm_df is not None:
-                matches = find_cnpj_cvm(nome_ativo, cvm_df, limit=1)
-                if matches:
-                    cnpj_result = matches[0]["cnpj"]
-            
-            figi_ticker = None
-            figi_name = None
-            if figi_results:
-                figi_ticker = figi_results[0].get("ticker")
-                figi_name = figi_results[0].get("name")
-            
-            result_df = pd.DataFrame([{
-                "Ativo": nome_ativo,
-                "Tipo Ativo": tipo_ativo,
-                "Classificação": classificacao,
-                "CNPJ (CVM)": cnpj_result,
-                "Ticker (OpenFIGI)": figi_ticker or ticker,
-                "Nome (OpenFIGI)": figi_name,
-                "Vencimento": vencimento
-            }])
-            
-            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+        
+        # Download
+        if not isin_df.empty:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                isin_df.to_excel(writer, sheet_name='ISINs', index=False)
+            buffer.seek(0)
+            st.download_button("📥 Baixar base_isin.xlsx", data=buffer, file_name="base_isin.xlsx")
     
     # Sidebar
     with st.sidebar:
-        st.markdown("### 📊 Status das APIs")
+        st.markdown("### 📊 Status")
         
         if cvm_df is not None:
             st.success(f"✅ CVM: {len(cvm_df):,} fundos")
         else:
-            st.error("❌ CVM: indisponível")
+            st.error("❌ CVM indisponível")
         
         # Testar OpenFIGI
-        test_result = search_openfigi("PETR4", "TICKER")
-        if test_result:
+        test = search_openfigi("PETR4")
+        if test:
             st.success("✅ OpenFIGI: conectado")
         else:
             st.warning("⚠️ OpenFIGI: verificar")
         
+        if not isin_df.empty:
+            st.success(f"✅ ISINs: {len(isin_df)} ({isin_source})")
+        
         st.divider()
         st.markdown("""
-        **Fontes de dados:**
-        - **CVM**: CNPJs de fundos brasileiros
-        - **OpenFIGI**: Tickers, FIGIs globais
+        ### 🔍 Fontes de dados
         
-        **Tipos de busca OpenFIGI:**
-        - `NAME` - Por nome
-        - `TICKER` - Por ticker
-        - `ISIN` - Por código ISIN
+        1. **OpenFIGI** - FIIs, ações, debêntures
+        2. **CVM** - CNPJ de fundos
+        3. **Base local** - ISINs (fallback)
         """)
 
 if __name__ == "__main__":
