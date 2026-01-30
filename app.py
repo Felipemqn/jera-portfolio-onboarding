@@ -1,7 +1,7 @@
 """
-JERA PORTFOLIO ONBOARDING v5
+JERA PORTFOLIO ONBOARDING v7
 ============================
-Com busca CNPJ melhorada
+Com mapeamento manual completo de CNPJs
 """
 
 import streamlit as st
@@ -31,6 +31,50 @@ TITULO_ISIN = {
     "NTNF_2029": "BRSTNCNTF1T4", "NTNF_2031": "BRSTNCNTF1U2", "NTNF_2033": "BRSTNCNTF1V0",
 }
 
+# =============================================================================
+# MAPEAMENTO MANUAL COMPLETO DE CNPJs
+# Baseado na lista corrigida do Felipe
+# =============================================================================
+
+MANUAL_CNPJ = {
+    # Fundos com match exato (nome completo)
+    "BLC III FIM CP": "28.153.046/0001-60",
+    "CS ALL MAR AB FICFIM": "07.766.151/0001-02",
+    "CS CERES I DEB FIM": "30.507.983/0001-18",
+    "CSHG A VISTA MU FCFM": "31.525.248/0001-08",
+    "CSHG ALL KAP Z FC FM": "25.036.554/0001-70",
+    "CSHG ALLOC LEG FCFIM": "42.596.861/0001-24",  # LEGACY
+    "CSHG ALLOCATION FIM": "01.626.802/0001-74",
+    "CSHG JIVE D FIC FIM": "21.556.491/0001-21",  # DISTRESSED
+    "CSHG JIVE III FICFIM": "35.865.564/0001-71",  # III
+    "G5 TERRAS FIM CP": "04.869.180/0001-01",
+    "HIX SAAS I FEE FIP": "42.246.602/0001-73",
+    "JBFO NITRO FIC FIDC": "30.556.626/0001-40",  # Exclusivo BTG
+    "JBFO SPS FIC FIM CP": "30.077.132/0001-82",  # SPS I
+    "K ZEVA FFIM": "41.853.515/0001-11",  # KAPITALO ZETA
+    "LUMINA FDR BR I FIM": "04.685.125/0001-53",
+    "MILAS II PF FIM CP": "36.517.750/0001-82",  # Exclusivo
+    "PATRIA CRED FIDC SUB": "19.729.263/0001-64",
+    "SPE SITUATIONSFCFIDC": "00.306.559/0001-44",
+    "SPECTRA BRIDGE FIC": "18.686.779/0001-06",  # BRIDGE FIM
+    "SPECTRA GAUDI FIM CP": "23.732.047/0001-45",  # CSHG GAUDI
+    "SPECTRA LATIN EQ III": "27.292.940/0001-58",  # VIC SPECTRA LATIN
+    "SPX CAPITAL PLUS FIQ": "30.609.175/0001-61",
+    "TESOURO SELIC FI RF": "04.857.834/0001-79",
+    "TREECORP TRATOR FIP": "13.950.067/0001-39",
+    "VIC CPHY FIC FIM CP": "35.271.142/0001-78",  # VIC JBFO ADAM
+    "VIC QIADRA ML II FIM": "34.081.573/0001-09",  # VIC QUADRA
+    "VIC QUATA FICFIM CP": "29.734.070/0001-55",  # VIC BAHIA AM
+    "VIC REC IMOB FIM CP": "30.492.962/0001-76",
+    "VIC ROOT CAP FIC FIM": "18.289.982/0001-49",
+    
+    # Variações de nome (parciais)
+    "MISSION 1.1 T5 FIP": "40.132.943/0001-92",
+    "MW EUREKA FUND": "00.000.000/0001-00",  # Fundo offshore
+    "OAKTREE REAL ESTATE": "00.000.000/0001-00",  # Fundo offshore
+    "RF CDB": "00.000.000/0001-00",  # CDB não tem CNPJ de fundo
+}
+
 def get_isin(tipo: str, vencimento: str) -> str:
     match = re.search(r"(\d{4})$", vencimento)
     if match:
@@ -50,70 +94,79 @@ def get_isin(tipo: str, vencimento: str) -> str:
     return None
 
 # =============================================================================
-# CVM FUND LOOKUP (Improved)
+# CVM FUND LOOKUP (Fallback)
 # =============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_cvm_data():
-    """Carrega DataFrame completo da CVM"""
     try:
         url = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
         df = pd.read_csv(url, sep=";", encoding="latin1", low_memory=False)
         return df
-    except Exception as e:
-        st.error(f"Erro ao carregar CVM: {e}")
+    except:
         return None
 
-def find_cnpj(fund_name: str, cvm_df: pd.DataFrame) -> str:
-    """Busca CNPJ usando palavras-chave (ignora siglas de tipo de fundo)"""
-    if cvm_df is None or cvm_df.empty:
+def find_cnpj_cvm(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set) -> str:
+    """Busca na CVM como fallback"""
+    if cvm_df is None:
         return None
     
     name_upper = fund_name.upper()
-    
-    # Palavras a ignorar (tipos de fundo, sufixos comuns)
-    skip_words = {
-        "FIM", "FIC", "FIDC", "FIP", "FIF", "FCFM", "FFIM", "FIQ", "FICFIM", 
-        "FC", "FM", "CP", "RF", "FI", "SUB", "FEE", "AB", "MU", "Z", "II", "III",
-        "I", "IV", "V", "PF", "ML", "BR", "CL", "T5", "REF", "OVER", "IPCA",
-        "PRE", "D", "LEG", "ALL", "MAR", "DEB"
-    }
-    
-    # Extrair palavras-chave relevantes
-    words = [w for w in name_upper.split() if w not in skip_words and len(w) > 1]
+    skip_words = {"FIM", "FIC", "FIDC", "FIP", "FCFM", "FFIM", "FIQ", "FC", "FM", "CP", "RF", "FI"}
+    words = [w for w in name_upper.split() if w not in skip_words and len(w) >= 3]
     
     if not words:
         return None
     
-    # Buscar progressivamente refinando
     candidates = cvm_df.copy()
-    
     for word in words:
-        new_candidates = candidates[
-            candidates["DENOM_SOCIAL"].str.upper().str.contains(word, na=False, regex=False)
-        ]
-        if len(new_candidates) > 0:
-            candidates = new_candidates
-        if len(candidates) == 1:
+        new_cand = candidates[candidates["DENOM_SOCIAL"].str.upper().str.contains(word, na=False, regex=False)]
+        if len(new_cand) > 0:
+            candidates = new_cand
+        if len(candidates) <= 3:
             break
     
     if len(candidates) > 0:
-        # Priorizar fundos em funcionamento normal
-        ativos = candidates[candidates["SIT"].str.contains("FUNCIONAMENTO", na=False)]
-        if len(ativos) > 0:
-            return str(ativos.iloc[0]["CNPJ_FUNDO"])
-        return str(candidates.iloc[0]["CNPJ_FUNDO"])
+        for _, row in candidates.iterrows():
+            cnpj = str(row["CNPJ_FUNDO"])
+            if cnpj not in used_cnpjs:
+                return cnpj
     
     return None
+
+def find_cnpj(fund_name: str, cvm_df: pd.DataFrame, used_cnpjs: set) -> tuple:
+    """Busca CNPJ: primeiro manual, depois CVM"""
+    name_clean = fund_name.strip().upper()
+    
+    # 1. Busca exata no mapeamento manual
+    if fund_name in MANUAL_CNPJ:
+        cnpj = MANUAL_CNPJ[fund_name]
+        if cnpj != "00.000.000/0001-00":
+            return cnpj, "MANUAL"
+        else:
+            return None, "OFFSHORE"
+    
+    # 2. Busca parcial no mapeamento manual
+    for key, cnpj in MANUAL_CNPJ.items():
+        if key in name_clean or name_clean in key:
+            if cnpj != "00.000.000/0001-00":
+                return cnpj, "MANUAL"
+    
+    # 3. Fallback para CVM
+    cnpj = find_cnpj_cvm(fund_name, cvm_df, used_cnpjs)
+    if cnpj:
+        return cnpj, "CVM"
+    
+    return None, None
 
 # =============================================================================
 # BTG PDF PARSER
 # =============================================================================
 
 def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
-    """Parser para extratos BTG"""
     assets = []
     metadata = {"fund_name": "", "nav": None}
+    used_cnpjs = set()
     
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
         tmp.write(pdf_file.read())
@@ -125,12 +178,10 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
             for page in pdf.pages:
                 all_text += (page.extract_text() or "") + "\n"
             
-            # Extract fund name
             match = re.search(r"(FI\s+MULT[^\n]+)", all_text)
             if match:
                 metadata["fund_name"] = match.group(1).strip()
             
-            # Extract patrimonio
             match = re.search(r"Patrimônio\s+([\d.,]+)", all_text)
             if match:
                 try:
@@ -138,7 +189,7 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                 except:
                     pass
             
-            # === PARSE FUNDOS ===
+            # FUNDOS
             fund_pattern = r"(\d+)-\s*([A-Z][A-Z0-9\s]+?(?:FI[MCAD]?|FIC|FIDC|FIP|FIF|FCFM|FFIM|FC FM|FIM CP|FICFIM|FIC FIM|FIQ|FI RF)[A-Z\s]*?)\s+(\d+\.\d{2})\s+([\d,]+\.\d{2})"
             
             for match in re.finditer(fund_pattern, all_text):
@@ -146,8 +197,12 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                 pct_pl = float(match.group(3))
                 value = float(match.group(4).replace(",", ""))
                 
-                # Find CNPJ
-                cnpj = find_cnpj(name, cvm_df)
+                cnpj, source = find_cnpj(name, cvm_df, used_cnpjs)
+                
+                if cnpj:
+                    used_cnpjs.add(cnpj)
+                
+                status = "OK" if cnpj else "PENDENTE"
                 
                 assets.append({
                     "description": name,
@@ -157,10 +212,11 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                     "vencimento": None,
                     "isin": None,
                     "cnpj": cnpj,
-                    "status": "OK" if cnpj else "PENDENTE"
+                    "fonte": source,
+                    "status": status
                 })
             
-            # === PARSE TITULOS PUBLICOS ===
+            # TITULOS PUBLICOS
             titulo_pattern = r"(\d+)-\s*(LFT|LTN|NTNB|NTN-?B)[A-Z\s]*\s+(\d+\.\d{2})\s+([\d,]+\.\d{2})\s+[\d,]+\s+[\d.,]+\s+(\d{2}/\d{2}/\d{4})"
             
             for match in re.finditer(titulo_pattern, all_text):
@@ -179,10 +235,11 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                     "vencimento": vencimento,
                     "isin": isin,
                     "cnpj": None,
+                    "fonte": "ISIN" if isin else None,
                     "status": "OK" if isin else "REVISAR"
                 })
             
-            # === PARSE TITULOS PRIVADOS ===
+            # TITULOS PRIVADOS
             privado_pattern = r"(\d+)-\s*(CRI|CRA|GYRA\d*|PRLK\d*)[A-Z0-9\s]*\s+(\d+\.\d{2})\s+([\d,]+\.\d{2})"
             
             for match in re.finditer(privado_pattern, all_text):
@@ -190,12 +247,7 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                 pct_pl = float(match.group(3))
                 value = float(match.group(4).replace(",", ""))
                 
-                if "CRI" in name.upper():
-                    tipo = "CRI"
-                elif "CRA" in name.upper():
-                    tipo = "CRA"
-                else:
-                    tipo = "DEBENTURE"
+                tipo = "CRI" if "CRI" in name.upper() else ("CRA" if "CRA" in name.upper() else "DEBENTURE")
                 
                 assets.append({
                     "description": name,
@@ -205,19 +257,19 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
                     "vencimento": None,
                     "isin": None,
                     "cnpj": None,
+                    "fonte": None,
                     "status": "PENDENTE"
                 })
             
             # Remove duplicates
             seen = set()
-            unique_assets = []
+            unique = []
             for a in assets:
                 key = f"{a['description']}_{a['value']}"
                 if key not in seen:
                     seen.add(key)
-                    unique_assets.append(a)
-            
-            assets = unique_assets
+                    unique.append(a)
+            assets = unique
     
     finally:
         Path(tmp_path).unlink(missing_ok=True)
@@ -230,35 +282,24 @@ def parse_btg_pdf(pdf_file, cvm_df: pd.DataFrame) -> tuple:
 
 def main():
     st.title("📊 Jera Portfolio Onboarding")
-    st.markdown("**Extratos BTG → Dados com CNPJ/ISIN automáticos**")
+    st.markdown("**Extratos BTG → Dados com CNPJ/ISIN**")
     
-    # Load CVM data
     with st.spinner("📚 Carregando base CVM..."):
         cvm_df = load_cvm_data()
     
     with st.sidebar:
         st.header("📁 Upload")
-        uploaded_file = st.file_uploader(
-            "Arraste o PDF aqui",
-            type=['pdf'],
-            help="Extratos BTG Pactual"
-        )
+        uploaded_file = st.file_uploader("Arraste o PDF aqui", type=['pdf'])
         
         st.divider()
+        st.markdown(f"✅ {len(MANUAL_CNPJ)} fundos mapeados")
         if cvm_df is not None:
-            st.success(f"✅ {len(cvm_df):,} fundos CVM")
-        
-        st.markdown("""
-        **Identificadores:**
-        - Fundos → **CNPJ** (CVM)
-        - Títulos → **ISIN**
-        """)
+            st.markdown(f"✅ {len(cvm_df):,} fundos CVM")
     
     if uploaded_file is None:
         st.info("👆 Faça upload de um extrato BTG")
         return
     
-    # Process
     with st.spinner("🔄 Processando..."):
         assets, metadata = parse_btg_pdf(uploaded_file, cvm_df)
     
@@ -266,39 +307,29 @@ def main():
         st.error("❌ Não foi possível extrair ativos")
         return
     
-    # Success
     st.success(f"✅ **{metadata.get('fund_name', 'Portfolio')}** - {len(assets)} ativos")
     
     if metadata.get("nav"):
         st.metric("Patrimônio", f"R$ {metadata['nav']:,.2f}")
     
-    # DataFrame
     df = pd.DataFrame(assets)
     
     # Stats
-    st.subheader("📊 Resumo")
-    
     col1, col2, col3, col4 = st.columns(4)
-    
-    total = len(df)
-    com_cnpj = df["cnpj"].notna().sum()
-    com_isin = df["isin"].notna().sum()
-    pendente = total - com_cnpj - com_isin
-    
     with col1:
-        st.metric("Total", total)
+        st.metric("Total", len(df))
     with col2:
-        st.metric("✅ CNPJ", int(com_cnpj))
+        st.metric("✅ OK", len(df[df["status"] == "OK"]))
     with col3:
-        st.metric("✅ ISIN", int(com_isin))
+        st.metric("🟡 Revisar", len(df[df["status"] == "REVISAR"]))
     with col4:
-        st.metric("⏳ Pendente", int(pendente))
+        st.metric("🔴 Pendente", len(df[df["status"] == "PENDENTE"]))
     
     # By type
     type_stats = df.groupby("type").agg(
         Qtd=("description", "count"),
         Valor=("value", "sum"),
-        Identificados=("status", lambda x: (x == "OK").sum())
+        OK=("status", lambda x: (x == "OK").sum())
     ).reset_index()
     type_stats["Valor"] = type_stats["Valor"].apply(lambda x: f"R$ {x:,.2f}")
     st.dataframe(type_stats, use_container_width=True, hide_index=True)
@@ -306,7 +337,7 @@ def main():
     # Table
     st.subheader("📝 Ativos")
     
-    cols = ["description", "type", "pct_pl", "value", "vencimento", "cnpj", "isin", "status"]
+    cols = ["description", "type", "pct_pl", "value", "cnpj", "isin", "fonte", "status"]
     df_display = df[[c for c in cols if c in df.columns]]
     
     edited_df = st.data_editor(
@@ -314,13 +345,13 @@ def main():
         use_container_width=True,
         column_config={
             "description": st.column_config.TextColumn("Descrição", width="large"),
-            "type": st.column_config.SelectboxColumn("Tipo", options=["FUNDO", "TITULO_PUBLICO", "CRI", "CRA", "DEBENTURE", "CDB", "LF", "FII", "FIDC", "FIP", "OUTROS"]),
+            "type": st.column_config.TextColumn("Tipo"),
             "pct_pl": st.column_config.NumberColumn("%PL", format="%.2f"),
             "value": st.column_config.NumberColumn("Valor (R$)", format="%.2f"),
-            "vencimento": st.column_config.TextColumn("Vencimento"),
             "cnpj": st.column_config.TextColumn("CNPJ", width="medium"),
             "isin": st.column_config.TextColumn("ISIN"),
-            "status": st.column_config.SelectboxColumn("Status", options=["OK", "REVISAR", "PENDENTE"]),
+            "fonte": st.column_config.TextColumn("Fonte"),
+            "status": st.column_config.TextColumn("Status"),
         },
         hide_index=True,
     )
@@ -332,7 +363,8 @@ def main():
     
     with col1:
         buffer = io.BytesIO()
-        edited_df.to_excel(buffer, index=False, sheet_name="Ativos")
+        export_df = edited_df.drop(columns=["fonte"], errors="ignore")
+        export_df.to_excel(buffer, index=False, sheet_name="Ativos")
         buffer.seek(0)
         st.download_button(
             "📥 Baixar Excel",
@@ -342,9 +374,10 @@ def main():
         )
     
     with col2:
+        export_df = edited_df.drop(columns=["fonte"], errors="ignore")
         st.download_button(
             "📥 Baixar JSON",
-            data=edited_df.to_json(orient="records", force_ascii=False, indent=2),
+            data=export_df.to_json(orient="records", force_ascii=False, indent=2),
             file_name=f"portfolio_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             mime="application/json"
         )
